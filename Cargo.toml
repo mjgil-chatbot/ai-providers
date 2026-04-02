@@ -1,0 +1,27 @@
+[package]
+name = "ai-providers"
+version = "0.1.0"
+edition = "2021"
+description = "Unified Rust adapters for streaming AI provider CLIs and APIs."
+readme = "README.md"
+license = "0BSD"
+keywords = ["ai", "llm", "cli", "streaming"]
+categories = ["api-bindings"]
+
+[lib]
+name = "ai_providers"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+libc = "0.2"
+rust-debug = { git = "https://github.com/mjgil-rust/rust-debug", rev = "9038be5", features = ["tracing-integration"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tempfile = "3"
+
+[dev-dependencies]
+cap = "0.1.2"
+pretty_assertions = "1.4"
