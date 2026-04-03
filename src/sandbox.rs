@@ -57,3 +57,39 @@ impl RunscMount {
         }
     }
 }
+pub fn wrap_command_string_with_runsc(
+    base_command: String,
+    working_dir: Option<&str>,
+    runsc_image: Option<&str>,
+) -> String {
+    let Some(image) = runsc_image.filter(|value| !value.trim().is_empty()) else {
+        return base_command;
+    };
+
+    let cwd = working_dir
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(".");
+    let base_command = rewrite_display_command_for_container(base_command);
+    format!(
+        "docker run --runtime=runsc --rm --init --workdir {} {} {}",
+        cwd, image, base_command
+    )
+}
+fn rewrite_display_command_for_container(base_command: String) -> String {
+    let mut parts = base_command.splitn(2, ' ');
+    let Some(program) = parts.next() else {
+        return base_command;
+    };
+    let rewritten_program = if Path::new(program).is_absolute() {
+        Path::new(program)
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.to_string())
+    } else {
+        program.to_string()
+    };
+    match parts.next() {
+        Some(rest) => format!("{rewritten_program} {rest}"),
+        None => rewritten_program,
+    }
+}

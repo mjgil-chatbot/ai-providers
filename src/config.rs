@@ -224,3 +224,6 @@ impl Default for KimiCliConfig {
         }
     }
 }
+pub fn prompt_needs_hyphen_guard(prompt: &str) -> bool {
+    prompt.trim_start().starts_with('-')
+}
