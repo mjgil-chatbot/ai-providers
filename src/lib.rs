@@ -6,4 +6,6 @@ mod live_summary_formatter;
 pub mod memory;
 pub mod sandbox;
 pub mod session;
+pub mod stream;
 pub mod summary;
+pub mod workspace;

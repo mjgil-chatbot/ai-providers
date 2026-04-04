@@ -6,10 +6,14 @@ use std::sync::{mpsc, Arc};
 use anyhow::Result;
 use rust_debug::tracing::{debug, error, info, warn};
 use serde_json::Value;
-use crate::config::prompt_needs_hyphen_guard;
-use crate::config::ClaudeCliConfig;
-use crate::sandbox::wrap_command_string_with_runsc;
+use crate::claude::response::{generate_json_line_summary, update_summary_from_event};
+use crate::config::{add_prompt_arg, has_mcp_servers, prompt_needs_hyphen_guard, ClaudeCliConfig};
+use crate::memory::{build_query_with_memory, MemoryContext};
+use crate::sandbox::{wrap_command_string_with_runsc, wrap_command_with_runsc};
 use crate::session::ProviderSession;
+use crate::stream::{self, ErrorContexts, StreamMessage};
+use crate::summary::JsonSummary;
+use crate::workspace;
 const STDERR_TAIL_MAX_LINES: usize = 120;
 fn claude_transport_base_url(config: &ClaudeCliConfig) -> Option<&str> {
     config
@@ -150,4 +154,402 @@ impl SubscriptionType {
     pub fn is_subscription(&self) -> bool {
         matches!(self, SubscriptionType::Max | SubscriptionType::Pro)
     }
+}
+pub fn get_subscription_type(config: &ClaudeCliConfig) -> SubscriptionType {
+    if let Some(subscription) = get_subscription_from_credentials_json(config)
+        .or_else(|| get_subscription_from_claude_json(config))
+    {
+        return subscription;
+    }
+    if config.config_dir.is_none() && std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return SubscriptionType::Api;
+    }
+    SubscriptionType::Unknown
+}
+fn get_subscription_from_credentials_json(config: &ClaudeCliConfig) -> Option<SubscriptionType> {
+    let path = if let Some(config_dir) = config.config_dir.as_ref() {
+        config_dir.join(".credentials.json")
+    } else {
+        let home = std::env::var("HOME").ok()?;
+        std::path::PathBuf::from(home).join(".claude/.credentials.json")
+    };
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_subscription_from_json(&content)
+}
+fn get_subscription_from_claude_json(config: &ClaudeCliConfig) -> Option<SubscriptionType> {
+    let path = if let Some(config_dir) = config.config_dir.as_ref() {
+        config_dir.join(".claude.json")
+    } else {
+        let home = std::env::var("HOME").ok()?;
+        std::path::PathBuf::from(home).join(".claude.json")
+    };
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
+    parse_claude_json_subscription(&json)
+}
+fn parse_claude_json_subscription(json: &Value) -> Option<SubscriptionType> {
+    let has_subscription = json
+        .get("hasAvailableSubscription")
+        .and_then(|value| value.as_bool())?;
+    if has_subscription {
+        let has_opus = json
+            .get("hasOpusPlanDefault")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if has_opus {
+            Some(SubscriptionType::Max)
+        } else {
+            Some(SubscriptionType::Pro)
+        }
+    } else if json.get("oauthAccount").is_some() {
+        Some(SubscriptionType::Api)
+    } else {
+        None
+    }
+}
+fn parse_subscription_from_json(json_str: &str) -> Option<SubscriptionType> {
+    let json: Value = serde_json::from_str(json_str).ok()?;
+    let subscription_type = json
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("subscriptionType"))
+        .and_then(|value| value.as_str())?;
+    match subscription_type.to_lowercase().as_str() {
+        "max" => Some(SubscriptionType::Max),
+        "pro" => Some(SubscriptionType::Pro),
+        "api" => Some(SubscriptionType::Api),
+        _ => None,
+    }
+}
+pub fn call_claude_cli_stream(
+    query: &str,
+    system_prompt: Option<&str>,
+    memory_context: Option<&MemoryContext>,
+    session: Option<ProviderSession>,
+    config: &ClaudeCliConfig,
+    tx: mpsc::Sender<StreamMessage>,
+    stop_signal: Arc<AtomicBool>,
+) -> Result<()> {
+    info!(query_len = query.len(), "starting claude cli stream");
+
+    if !config.allow_api_billing {
+        let subscription_type = get_subscription_type(config);
+        debug!(?subscription_type, "subscription type detected");
+        if !subscription_type.is_subscription() {
+            let login_cmd = if let Some(config_dir) = config.config_dir.as_ref() {
+                format!("CLAUDE_CONFIG_DIR={} claude login", config_dir.display())
+            } else {
+                "claude login".to_string()
+            };
+            let error_msg = match subscription_type {
+                SubscriptionType::Api => {
+                    format!("API billing detected. Please login with a subscription account using '{login_cmd}' or enable allow_api_billing.")
+                }
+                SubscriptionType::Unknown => {
+                    format!("Unable to detect subscription type. Please ensure you are logged in using '{login_cmd}'.")
+                }
+                _ => unreachable!(),
+            };
+            let _ = tx.send(StreamMessage {
+                response: error_msg,
+                command: String::new(),
+                session_id: None,
+                summary: None,
+                is_final: true,
+            });
+            return Ok(());
+        }
+    }
+
+    if let Some(config_dir) = config.config_dir.as_ref() {
+        if !config_dir.is_dir() {
+            let _ = tx.send(StreamMessage {
+                response: format!(
+                    "Claude config directory not found: {}",
+                    config_dir.display()
+                ),
+                command: String::new(),
+                session_id: None,
+                summary: None,
+                is_final: true,
+            });
+            return Ok(());
+        }
+    }
+
+    if config.require_mcp_servers && !has_mcp_servers(config.config_dir.as_deref()) {
+        let _ = tx.send(StreamMessage {
+            response: "No MCP servers found in provider config.".to_string(),
+            command: String::new(),
+            session_id: None,
+            summary: None,
+            is_final: true,
+        });
+        return Ok(());
+    }
+
+    let mut cmd = Command::new(&config.cli);
+    workspace::apply_session_working_dir(&mut cmd, session.as_ref());
+    let effective_query = build_query_with_memory(query, memory_context);
+
+    if let Some(config_dir) = config.config_dir.as_ref() {
+        cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+    for (key, value) in &config.extra_env {
+        cmd.env(key, value);
+    }
+
+    let session_id_to_resume = session
+        .as_ref()
+        .and_then(|value| value.claude_session_id.as_ref());
+    if let Some(prompt) = effective_claude_system_prompt(
+        config,
+        session.as_ref(),
+        system_prompt,
+        session_id_to_resume.is_some(),
+    ) {
+        cmd.arg("--append-system-prompt").arg(prompt);
+    }
+    if config.skip_permissions {
+        cmd.arg("--dangerously-skip-permissions");
+    }
+    if let Some(session_id) = session_id_to_resume {
+        cmd.arg("--resume").arg(session_id);
+    }
+    if config.verbose_output {
+        cmd.arg("--verbose");
+    }
+    cmd.arg("--model").arg(&config.model);
+    if let Some(schema) = config.json_schema.as_deref() {
+        cmd.arg("--json-schema").arg(schema);
+    }
+    cmd.arg("--output-format").arg(&config.output_format);
+    add_prompt_arg(&mut cmd, &effective_query);
+    let runsc_workspace_sync = wrap_command_with_runsc(
+        &mut cmd,
+        config.runsc_image.as_deref(),
+        &config.runsc_workspace_includes,
+        &config.runsc_mounts,
+    )?;
+
+    let command_str = build_claude_command_string(
+        system_prompt,
+        session.as_ref(),
+        session_id_to_resume.map(|value| value.as_str()),
+        &effective_query,
+        config,
+    );
+
+    let (cli, reader) = match stream::CliProcess::spawn(
+        &mut cmd,
+        "claude",
+        &command_str,
+        &tx,
+        stop_signal.clone(),
+        STDERR_TAIL_MAX_LINES,
+    ) {
+        Some(pair) => pair,
+        None => return Ok(()),
+    };
+
+    let mut response_content = String::new();
+    let mut json_summaries = String::new();
+    let mut actual_text_content = String::new();
+    let mut extracted_session_id: Option<String> = None;
+    let mut error_occurred = false;
+    let mut error_message = String::new();
+    let mut last_error_detail: Option<String> = None;
+    let mut stdout_tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_MAX_LINES);
+    let mut last_stream_payload = String::new();
+    let mut aggregated_summary = JsonSummary::new();
+
+    for line in reader.lines() {
+        if cli.is_stopped() {
+            warn!("stop signal triggered during stream read");
+            cli.kill();
+            let _ = tx.send(StreamMessage {
+                response: "Process stopped by user.".to_string(),
+                command: command_str.clone(),
+                session_id: None,
+                summary: None,
+                is_final: true,
+            });
+            return Ok(());
+        }
+
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                error!(error=%e, "error reading stdout stream");
+                cli.kill();
+                let _ = tx.send(StreamMessage {
+                    response: format!("Error reading stream: {}", e),
+                    command: command_str.clone(),
+                    session_id: None,
+                    summary: None,
+                    is_final: true,
+                });
+                return Ok(());
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<Value>(&line) {
+            Ok(json) => {
+                let line_summary =
+                    generate_json_line_summary(&line, aggregated_summary.model.as_deref());
+                if !json_summaries.is_empty() {
+                    json_summaries.push('\n');
+                }
+                json_summaries.push_str(&line_summary);
+                response_content = if actual_text_content.is_empty() {
+                    json_summaries.clone()
+                } else {
+                    format!("{}\n\n\n{}", json_summaries, actual_text_content)
+                };
+                last_stream_payload = response_content.clone();
+                let _ = tx.send(StreamMessage {
+                    response: response_content.clone(),
+                    command: command_str.clone(),
+                    session_id: None,
+                    summary: None,
+                    is_final: false,
+                });
+
+                update_summary_from_event(&mut aggregated_summary, &json);
+                if extracted_session_id.is_none() {
+                    extracted_session_id = json
+                        .get("session_id")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_string());
+                }
+
+                if let Some(detail) = stream::extract_error_detail(&json) {
+                    last_error_detail = Some(detail);
+                }
+
+                match json.get("type").and_then(|value| value.as_str()) {
+                    Some("assistant") => {
+                        if let Some(message) = json.get("message") {
+                            if let Some(content) =
+                                message.get("content").and_then(|value| value.as_array())
+                            {
+                                let text = content
+                                    .iter()
+                                    .filter(|item| {
+                                        item.get("type").and_then(|value| value.as_str())
+                                            == Some("text")
+                                    })
+                                    .filter_map(|item| {
+                                        item.get("text").and_then(|value| value.as_str())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                if !text.is_empty() {
+                                    actual_text_content = text;
+                                }
+                            }
+                        }
+                    }
+                    Some("result") => {
+                        error_occurred = json
+                            .get("is_error")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
+                        if error_occurred {
+                            error_message = json
+                                .get("result")
+                                .and_then(|value| value.as_str())
+                                .or_else(|| json.get("error").and_then(|value| value.as_str()))
+                                .unwrap_or("unknown error")
+                                .to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Err(_) => {
+                if !line.starts_with('{') && !line.trim().is_empty() {
+                    if stdout_tail.len() == STDERR_TAIL_MAX_LINES {
+                        stdout_tail.pop_front();
+                    }
+                    stdout_tail.push_back(line.clone());
+                    response_content.push_str(&line);
+                    response_content.push('\n');
+                }
+            }
+        }
+    }
+
+    info!(
+        model = %config.model,
+        response_len = response_content.len(),
+        actual_text_len = actual_text_content.len(),
+        has_session_id = extracted_session_id.is_some(),
+        summary_response_count = aggregated_summary.response_count,
+        stdout_tail_lines = stdout_tail.len(),
+        error_occurred,
+        "claude-compatible stdout stream closed; waiting for cli process exit"
+    );
+    let finish = cli.finish("claude");
+    runsc_workspace_sync.sync_back()?;
+    let process_ok = finish.wait_error.is_none()
+        && finish
+            .exit_status
+            .as_ref()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    info!(
+        model = %config.model,
+        process_ok,
+        exit_status = ?finish.exit_status,
+        wait_error = ?finish.wait_error,
+        stderr_tail_len = finish.stderr_tail.len(),
+        response_len = response_content.len(),
+        actual_text_len = actual_text_content.len(),
+        has_session_id = extracted_session_id.is_some(),
+        summary_response_count = aggregated_summary.response_count,
+        error_occurred,
+        "claude-compatible cli process exit observed"
+    );
+    if !process_ok || error_occurred {
+        let contexts = ErrorContexts::build(
+            &finish.stderr_tail,
+            &stdout_tail,
+            &last_stream_payload,
+            &last_error_detail,
+            STDERR_TAIL_MAX_LINES,
+        );
+        let detail =
+            contexts.best_failure_detail(finish.exit_status.as_ref(), finish.wait_error.as_deref());
+        let response = if error_message.is_empty() {
+            format!("Claude command failed.{}", detail)
+        } else {
+            format!("Claude command failed: {}{}", error_message, detail)
+        };
+        let _ = tx.send(StreamMessage {
+            response,
+            command: command_str,
+            session_id: extracted_session_id,
+            summary: Some(aggregated_summary),
+            is_final: true,
+        });
+        return Ok(());
+    }
+
+    let final_response = if actual_text_content.is_empty() {
+        response_content
+    } else {
+        actual_text_content
+    };
+    let _ = tx.send(StreamMessage {
+        response: final_response,
+        command: command_str,
+        session_id: extracted_session_id,
+        summary: Some(aggregated_summary),
+        is_final: true,
+    });
+    Ok(())
 }

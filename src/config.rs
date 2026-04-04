@@ -227,3 +227,56 @@ impl Default for KimiCliConfig {
 pub fn prompt_needs_hyphen_guard(prompt: &str) -> bool {
     prompt.trim_start().starts_with('-')
 }
+pub fn add_prompt_arg(cmd: &mut std::process::Command, prompt: &str) {
+    cmd.arg("-p").arg(prompt);
+}
+pub fn has_mcp_servers(config_dir: Option<&Path>) -> bool {
+    let Some(path) = claude_config_path(config_dir) else {
+        return false;
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(json) => json,
+        Err(_) => return false,
+    };
+
+    let top_level = json.get("mcpServers").map(has_entries).unwrap_or(false);
+    if top_level {
+        return true;
+    }
+
+    json.get("projects")
+        .and_then(|projects| projects.as_object())
+        .map(|projects| {
+            projects
+                .values()
+                .any(|project| project.get("mcpServers").map(has_entries).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+fn claude_config_path(config_dir: Option<&Path>) -> Option<PathBuf> {
+    claude_config_dir(config_dir).map(|config_dir| config_dir.join(".claude.json"))
+}
+fn claude_config_dir(config_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(config_dir) = config_dir {
+        return Some(config_dir.to_path_buf());
+    }
+
+    if let Some(config_dir) =
+        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(config_dir));
+    }
+
+    dirs::home_dir()
+}
+fn has_entries(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
