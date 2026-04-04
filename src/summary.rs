@@ -4,12 +4,166 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub name: String,
+    pub input_preview: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TurnUsage {
+    pub timestamp: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub duration_ms: u64,
+    pub cost_usd: f64,
+    pub num_turns: u32,
+    #[serde(default)]
+    pub context_window_tokens: u64,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JsonSummary {
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub total_duration_ms: u64,
+    pub total_cost_usd: f64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    pub tools_used: Vec<String>,
+    pub response_count: u32,
+    #[serde(default)]
+    pub context_window_tokens: u64,
+    #[serde(default)]
+    pub context_window_size: u64,
+    #[serde(default)]
+    pub num_compactions: u32,
+    #[serde(default)]
+    pub turn_history: Vec<TurnUsage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_tool_calls: Vec<ToolCallRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JsonSummaryPreview {
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub total_duration_ms: u64,
+    pub total_cost_usd: f64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub tools_used: Vec<String>,
+    pub response_count: u32,
+    pub context_window_tokens: u64,
+    pub context_window_size: u64,
+    pub num_compactions: u32,
+    pub turn_count: usize,
+    pub recent_turns: Vec<TurnUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+const PREVIEW_RECENT_TURNS: usize = 5;
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 120;
 static MCP_SERVER_COMMANDS: Mutex<Option<McpServerCommandCache>> = Mutex::new(None);
 #[derive(Clone, Debug)]
 struct McpServerCommandCache {
     path: PathBuf,
     commands: HashMap<String, String>,
+}
+impl JsonSummary {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn to_preview(&self) -> JsonSummaryPreview {
+        let recent_start = self.turn_history.len().saturating_sub(PREVIEW_RECENT_TURNS);
+        JsonSummaryPreview {
+            session_id: self.session_id.clone(),
+            model: self.model.clone(),
+            total_duration_ms: self.total_duration_ms,
+            total_cost_usd: self.total_cost_usd,
+            total_input_tokens: self.total_input_tokens,
+            total_output_tokens: self.total_output_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            tools_used: self.tools_used.clone(),
+            response_count: self.response_count,
+            context_window_tokens: self.context_window_tokens,
+            context_window_size: self.context_window_size,
+            num_compactions: self.num_compactions,
+            turn_count: self.turn_history.len(),
+            recent_turns: self.turn_history[recent_start..].to_vec(),
+            reasoning_effort: self.reasoning_effort.clone(),
+        }
+    }
+
+    pub fn merge(&mut self, other: &JsonSummary) {
+        self.response_count += other.response_count;
+        self.total_duration_ms += other.total_duration_ms;
+        self.total_input_tokens += other.total_input_tokens;
+        self.total_output_tokens += other.total_output_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.total_cost_usd += other.total_cost_usd;
+
+        if other.context_window_tokens > 0 {
+            self.context_window_tokens = other.context_window_tokens;
+        }
+        if other.context_window_size > 0 {
+            self.context_window_size = other.context_window_size;
+        }
+        if self.session_id.is_none() {
+            self.session_id = other.session_id.clone();
+        }
+        if self.model.is_none() {
+            self.model = other.model.clone();
+        }
+        if self.reasoning_effort.is_none() {
+            self.reasoning_effort = other.reasoning_effort.clone();
+        }
+
+        for tool in &other.tools_used {
+            if !self.tools_used.contains(tool) {
+                self.tools_used.push(tool.clone());
+            }
+        }
+
+        self.num_compactions += other.num_compactions;
+        self.turn_history.extend(other.turn_history.iter().cloned());
+        self.pending_tool_calls
+            .extend(other.pending_tool_calls.iter().cloned());
+    }
+
+    pub fn record_turn_usage(&mut self, turn: &JsonSummary) {
+        self.turn_history.push(TurnUsage {
+            timestamp: Utc::now().to_rfc3339(),
+            input_tokens: turn.total_input_tokens,
+            output_tokens: turn.total_output_tokens,
+            cache_creation_tokens: turn.cache_creation_tokens,
+            cache_read_tokens: turn.cache_read_tokens,
+            duration_ms: turn.total_duration_ms,
+            cost_usd: turn.total_cost_usd,
+            num_turns: turn.response_count,
+            context_window_tokens: turn.context_window_tokens,
+            tool_calls: turn.pending_tool_calls.clone(),
+        });
+    }
 }
 pub fn format_tool_input_preview(name: &str, input: &Value) -> String {
     let normalized = resolve_tool_input_value(input).or_else(|| match input {
