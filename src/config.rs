@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+
 use crate::sandbox::RunscMount;
+
 #[derive(Clone, Debug)]
 pub struct ClaudeCliConfig {
     pub cli: String,
@@ -16,6 +18,7 @@ pub struct ClaudeCliConfig {
     pub runsc_workspace_includes: Vec<String>,
     pub runsc_mounts: Vec<RunscMount>,
 }
+
 impl Default for ClaudeCliConfig {
     fn default() -> Self {
         Self {
@@ -35,6 +38,7 @@ impl Default for ClaudeCliConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct CodexCliConfig {
     pub cli: String,
@@ -50,6 +54,7 @@ pub struct CodexCliConfig {
     pub runsc_workspace_includes: Vec<String>,
     pub runsc_mounts: Vec<RunscMount>,
 }
+
 impl Default for CodexCliConfig {
     fn default() -> Self {
         Self {
@@ -68,6 +73,7 @@ impl Default for CodexCliConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct GeminiCliConfig {
     pub cli: String,
@@ -81,6 +87,7 @@ pub struct GeminiCliConfig {
     pub runsc_workspace_includes: Vec<String>,
     pub runsc_mounts: Vec<RunscMount>,
 }
+
 impl Default for GeminiCliConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +104,7 @@ impl Default for GeminiCliConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct OpenRouterConfig {
     pub base_url: String,
@@ -108,6 +116,7 @@ pub struct OpenRouterConfig {
     /// Provider-level system prompt prepended before the session system prompt.
     pub default_system_prompt: Option<String>,
 }
+
 impl Default for OpenRouterConfig {
     fn default() -> Self {
         Self {
@@ -120,6 +129,7 @@ impl Default for OpenRouterConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct OpenRouterCliConfig {
     pub cli: String,
@@ -134,6 +144,7 @@ pub struct OpenRouterCliConfig {
     /// Path to .mcp.json for MCP server definitions.
     pub mcp_config: Option<String>,
 }
+
 impl Default for OpenRouterCliConfig {
     fn default() -> Self {
         Self {
@@ -150,6 +161,7 @@ impl Default for OpenRouterCliConfig {
         }
     }
 }
+
 impl From<OpenRouterCliConfig> for OpenRouterConfig {
     fn from(c: OpenRouterCliConfig) -> Self {
         Self {
@@ -162,6 +174,7 @@ impl From<OpenRouterCliConfig> for OpenRouterConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct QwenCodeCliConfig {
     pub cli: String,
@@ -178,6 +191,7 @@ pub struct QwenCodeCliConfig {
     pub runsc_workspace_includes: Vec<String>,
     pub runsc_mounts: Vec<RunscMount>,
 }
+
 impl Default for QwenCodeCliConfig {
     fn default() -> Self {
         Self {
@@ -197,6 +211,7 @@ impl Default for QwenCodeCliConfig {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct KimiCliConfig {
     pub cli: String,
@@ -209,6 +224,7 @@ pub struct KimiCliConfig {
     pub runsc_workspace_includes: Vec<String>,
     pub runsc_mounts: Vec<RunscMount>,
 }
+
 impl Default for KimiCliConfig {
     fn default() -> Self {
         Self {
@@ -224,12 +240,20 @@ impl Default for KimiCliConfig {
         }
     }
 }
+
 pub fn prompt_needs_hyphen_guard(prompt: &str) -> bool {
     prompt.trim_start().starts_with('-')
 }
+
+pub fn format_prompt_arg(prompt: &str) -> String {
+    let escaped = prompt.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("-p \"{}\"", escaped)
+}
+
 pub fn add_prompt_arg(cmd: &mut std::process::Command, prompt: &str) {
     cmd.arg("-p").arg(prompt);
 }
+
 pub fn has_mcp_servers(config_dir: Option<&Path>) -> bool {
     let Some(path) = claude_config_path(config_dir) else {
         return false;
@@ -258,9 +282,11 @@ pub fn has_mcp_servers(config_dir: Option<&Path>) -> bool {
         })
         .unwrap_or(false)
 }
+
 fn claude_config_path(config_dir: Option<&Path>) -> Option<PathBuf> {
     claude_config_dir(config_dir).map(|config_dir| config_dir.join(".claude.json"))
 }
+
 fn claude_config_dir(config_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(config_dir) = config_dir {
         return Some(config_dir.to_path_buf());
@@ -274,9 +300,74 @@ fn claude_config_dir(config_dir: Option<&Path>) -> Option<PathBuf> {
 
     dirs::home_dir()
 }
+
 fn has_entries(value: &serde_json::Value) -> bool {
     value
         .as_object()
         .map(|value| !value.is_empty())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_mcp_servers;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn detects_project_scoped_mcp_servers() {
+        let dir = unique_temp_dir("config");
+        fs::write(
+            dir.join(".claude.json"),
+            r#"{"projects":{"/tmp/project":{"mcpServers":{"memory":{}}}}}"#,
+        )
+        .unwrap();
+
+        assert!(has_mcp_servers(Some(&dir)));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detects_top_level_mcp_servers() {
+        let dir = unique_temp_dir("config");
+        fs::write(dir.join(".claude.json"), r#"{"mcpServers":{"memory":{}}}"#).unwrap();
+
+        assert!(has_mcp_servers(Some(&dir)));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detects_mcp_servers_from_claude_config_dir_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir("config-env");
+        fs::write(dir.join(".claude.json"), r#"{"mcpServers":{"memory":{}}}"#).unwrap();
+
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &dir);
+
+        assert!(has_mcp_servers(None));
+
+        match previous {
+            Some(previous) => std::env::set_var("CLAUDE_CONFIG_DIR", previous),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ai-providers-{name}-{suffix}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 }
