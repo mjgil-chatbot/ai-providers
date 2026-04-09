@@ -6,6 +6,7 @@ pub mod gemini;
 pub mod kimi;
 mod live_summary_formatter;
 pub mod memory;
+pub mod openrouter;
 pub mod sandbox;
 pub mod session;
 pub mod stream;
