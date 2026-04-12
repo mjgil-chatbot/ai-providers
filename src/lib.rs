@@ -7,6 +7,7 @@ pub mod kimi;
 mod live_summary_formatter;
 pub mod memory;
 pub mod openrouter;
+pub mod qwen_code;
 pub mod sandbox;
 pub mod session;
 pub mod stream;
