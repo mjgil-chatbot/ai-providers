@@ -11,6 +11,7 @@ use crate::memory::{build_query_with_memory, MemoryContext};
 use crate::session::ProviderSession;
 use crate::stream::{self, StreamMessage};
 use crate::summary::{format_tool_input_preview, JsonSummary, ToolCallRecord};
+use super::default_executor::default_executor;
 use super::tool_exec::parse_tool_call;
 pub use super::tool_exec::TextToolCall;
 /// Maximum number of agent loop iterations (tool call → result → next response).
@@ -480,4 +481,165 @@ fn stream_openrouter_turn_impl(
             tool_call: None,
         })
     }
+}
+/// Stream OpenRouter with tool execution using the provided executor.
+/// The executor callback handles tool execution - callers should provide their own
+/// for permission enforcement. For backward compatibility, use this with the
+/// default_tool_executor.
+pub fn call_openrouter_stream_with_executor(
+    query: &str,
+    system_prompt: Option<&str>,
+    memory_context: Option<&MemoryContext>,
+    session: Option<ProviderSession>,
+    config: &OpenRouterConfig,
+    tx: mpsc::Sender<StreamMessage>,
+    stop_signal: Arc<AtomicBool>,
+    executor: ToolExecutor,
+) -> Result<()> {
+    info!(
+        model = %config.model,
+        query_len = query.len(),
+        "starting openrouter stream with custom executor"
+    );
+
+    let mut messages = build_openrouter_prompt(
+        system_prompt,
+        query,
+        session.as_ref(),
+        memory_context,
+        config.default_system_prompt.as_deref(),
+    );
+
+    let command_str = build_openrouter_command_string(
+        system_prompt,
+        query,
+        session.as_ref(),
+        memory_context,
+        config,
+    );
+
+    let mut full_response = String::new();
+    let mut summary = JsonSummary::new();
+    summary.model = Some(config.model.clone());
+    summary.context_window_size = config.context_window_size;
+
+    let session_ref = session.as_ref();
+
+    for iteration in 0..MAX_TOOL_ITERATIONS {
+        if stop_signal.load(Ordering::Acquire) {
+            break;
+        }
+
+        let outcome = stream_openrouter_turn_impl(
+            query,
+            system_prompt,
+            memory_context,
+            session_ref,
+            config,
+            tx.clone(),
+            &stop_signal,
+            None,
+        )?;
+
+        summary = outcome.summary;
+
+        if outcome.error {
+            return Ok(());
+        }
+
+        // Check if the response contains a tool call
+        if let Some((tool_call, preamble)) = parse_tool_call(&outcome.response_content) {
+            info!(
+                tool = %tool_call.tool,
+                iteration = iteration,
+                "detected tool call in openrouter response, executing via callback"
+            );
+
+            // Build up the full response shown to the user
+            let preamble = preamble.trim_end();
+            if !preamble.is_empty() {
+                if !full_response.is_empty() {
+                    full_response.push('\n');
+                }
+                full_response.push_str(preamble);
+            }
+
+            // Execute the tool via the provided executor
+            let tool_name = tool_call.tool.clone();
+            let exec_result = executor(tool_call);
+
+            // Show tool execution in the streamed response
+            let tool_display = format!(
+                "\n\n**[Tool: {}]** {}\n\n<details>\n<summary>Tool output</summary>\n\n```\n{}\n```\n</details>\n\n",
+                tool_name,
+                if exec_result.success { "✓" } else { "✗" },
+                exec_result.output.trim()
+            );
+            full_response.push_str(&tool_display);
+
+            // Send intermediate update showing tool execution
+            let _ = tx.send(StreamMessage {
+                response: full_response.clone(),
+                command: command_str.clone(),
+                session_id: None,
+                summary: Some(summary.clone()),
+                is_final: false,
+            });
+
+            // Append the assistant message and tool result to conversation for
+            // the next API call.
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": outcome.response_content.trim()
+            }));
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "Tool result for {}:\n```\n{}\n```\nContinue with the task. If you need to use another tool, output the JSON tool call. If you are done, provide your final answer.",
+                    tool_name,
+                    exec_result.output.trim()
+                )
+            }));
+        } else {
+            // No tool call — this is the final response
+            if !full_response.is_empty() {
+                full_response.push_str(&outcome.response_content);
+            } else {
+                full_response = outcome.response_content;
+            }
+            break;
+        }
+    }
+
+    let _ = tx.send(StreamMessage {
+        response: full_response,
+        command: command_str,
+        session_id: None,
+        summary: Some(summary),
+        is_final: true,
+    });
+    Ok(())
+}
+/// Stream OpenRouter with the default tool executor (no permission enforcement).
+/// For permission enforcement, use stream_openrouter_turn with a custom executor
+/// in the calling code.
+pub fn call_openrouter_stream(
+    query: &str,
+    system_prompt: Option<&str>,
+    memory_context: Option<&MemoryContext>,
+    session: Option<ProviderSession>,
+    config: &OpenRouterConfig,
+    tx: mpsc::Sender<StreamMessage>,
+    stop_signal: Arc<AtomicBool>,
+) -> Result<()> {
+    call_openrouter_stream_with_executor(
+        query,
+        system_prompt,
+        memory_context,
+        session,
+        config,
+        tx,
+        stop_signal,
+        default_executor(),
+    )
 }
