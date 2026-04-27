@@ -453,6 +453,9 @@ fn prepare_shared_runsc_workspace(
 
     Ok(staged_root)
 }
+pub fn program_directory_mounts(command: &str) -> Vec<PathBuf> {
+    program_mounts(&OsString::from(command))
+}
 fn program_mounts(program: &OsString) -> Vec<PathBuf> {
     let path = Path::new(program);
     let resolved = if path.is_absolute() {
