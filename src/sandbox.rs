@@ -4,17 +4,22 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
 use anyhow::{Context, Result};
 use tempfile::TempDir;
+
 #[path = "sandbox_glibc.rs"]
 mod sandbox_glibc;
 #[path = "sandbox_workspace.rs"]
 mod sandbox_workspace;
 use sandbox_glibc::ensure_runsc_image_glibc_compatibility;
+#[cfg(test)]
+use sandbox_glibc::{parse_glibc_version_line, GlibcVersion, RUNSC_GLIBC_PROBE_ENTRYPOINT};
 use sandbox_workspace::{
     copy_workspace_root_contents, effective_workspace_includes, is_ignorable_rust_incremental_lock,
     normalize_workspace_includes, sync_workspace_root_contents,
 };
+
 const RUNSC_REQUIRED_COMMANDS: &[&str] = &["docker", "runsc"];
 const RUNSC_WORKSPACE_PATH_ARG_FLAGS: &[&str] = &["--include-directories", "--workspace-root"];
 const RUNSC_STAGING_DIR_ENV: &str = "RUST_CHATBOT_RUNSC_STAGING_DIR";
@@ -64,6 +69,7 @@ const RUNSC_FORCED_ENV_NAMES: &[&str] = &[
     "GEMINI_FORCE_FILE_STORAGE",
     "GEMINI_CLI_PROJECT_SETTINGS_PATH",
 ];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunscMountTarget {
     SamePath,
@@ -71,11 +77,13 @@ pub enum RunscMountTarget {
     WorkspaceRelative(PathBuf),
     ContainerHome(PathBuf),
 }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunscMount {
     pub host: PathBuf,
     pub target: RunscMountTarget,
 }
+
 impl RunscMount {
     pub fn same_path(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -114,6 +122,7 @@ impl RunscMount {
         }
     }
 }
+
 #[derive(Debug)]
 pub struct RunscWorkspaceSync {
     _temp_dir: Option<TempDir>,
@@ -122,6 +131,7 @@ pub struct RunscWorkspaceSync {
     includes: Vec<PathBuf>,
     sync_back_enabled: bool,
 }
+
 impl RunscWorkspaceSync {
     pub fn noop() -> Self {
         Self {
@@ -158,6 +168,7 @@ impl RunscWorkspaceSync {
         Ok(())
     }
 }
+
 pub fn wrap_command_with_runsc(
     command: &mut Command,
     runsc_image: Option<&str>,
@@ -318,6 +329,7 @@ pub fn wrap_command_with_runsc(
     *command = wrapped;
     Ok(workspace_sync)
 }
+
 pub fn wrap_command_string_with_runsc(
     base_command: String,
     working_dir: Option<&str>,
@@ -336,11 +348,13 @@ pub fn wrap_command_string_with_runsc(
         cwd, image, base_command
     )
 }
+
 fn command_exists(command: &str) -> bool {
     env::var_os("PATH")
         .map(|path| env::split_paths(&path).any(|dir| dir.join(command).is_file()))
         .unwrap_or(false)
 }
+
 fn stage_runsc_workspace(source_root: &Path, includes: &[String]) -> Result<RunscWorkspaceSync> {
     let includes = normalize_workspace_includes(includes, source_root)?;
     let effective_includes = effective_workspace_includes(&includes);
@@ -381,6 +395,7 @@ fn stage_runsc_workspace(source_root: &Path, includes: &[String]) -> Result<Runs
         sync_back_enabled,
     })
 }
+
 fn create_runsc_staging_dir() -> Result<TempDir> {
     if let Some(dir) = env::var_os(RUNSC_STAGING_DIR_ENV).filter(|value| !value.is_empty()) {
         let dir = PathBuf::from(dir);
@@ -414,6 +429,7 @@ fn create_runsc_staging_dir() -> Result<TempDir> {
         .tempdir()
         .context("failed to create runsc staging directory")
 }
+
 fn env_var_enabled(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -423,11 +439,13 @@ fn env_var_enabled(name: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
 fn shared_runsc_workspace_root() -> Option<PathBuf> {
     std::env::var_os(RUNSC_SHARED_WORKSPACE_ROOT_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
+
 fn prepare_shared_runsc_workspace(
     shared_root: &Path,
     source_root: &Path,
@@ -453,9 +471,11 @@ fn prepare_shared_runsc_workspace(
 
     Ok(staged_root)
 }
+
 pub fn program_directory_mounts(command: &str) -> Vec<PathBuf> {
     program_mounts(&OsString::from(command))
 }
+
 fn program_mounts(program: &OsString) -> Vec<PathBuf> {
     let path = Path::new(program);
     let resolved = if path.is_absolute() {
@@ -494,6 +514,7 @@ fn program_mounts(program: &OsString) -> Vec<PathBuf> {
 
     vec![symlink_parent]
 }
+
 fn follow_program_symlinks(path: &Path) -> Option<PathBuf> {
     let mut path = path.to_path_buf();
     let mut followed = false;
@@ -508,6 +529,7 @@ fn follow_program_symlinks(path: &Path) -> Option<PathBuf> {
     }
     None
 }
+
 fn lexical_symlink_target(parent: &Path, target: PathBuf) -> PathBuf {
     let target = if target.is_absolute() {
         target
@@ -526,6 +548,7 @@ fn lexical_symlink_target(parent: &Path, target: PathBuf) -> PathBuf {
     }
     normalized
 }
+
 fn should_skip_program_mount(path: &Path) -> bool {
     matches!(
         path,
@@ -540,6 +563,7 @@ fn should_skip_program_mount(path: &Path) -> bool {
             || p == Path::new("/usr/local/sbin")
     )
 }
+
 fn common_path_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
     let mut common: Vec<std::path::Component> = Vec::new();
     for (ca, cb) in a.components().zip(b.components()) {
@@ -554,6 +578,7 @@ fn common_path_ancestor(a: &Path, b: &Path) -> Option<PathBuf> {
     }
     Some(common.iter().collect())
 }
+
 fn resolve_program_in_path(program: &OsString) -> Option<PathBuf> {
     let name = Path::new(program);
     // Only resolve simple names, not paths with separators.
@@ -569,6 +594,7 @@ fn resolve_program_in_path(program: &OsString) -> Option<PathBuf> {
     }
     None
 }
+
 fn resolve_container_program(program: &OsString) -> OsString {
     let path = Path::new(program);
     if path.is_absolute() {
@@ -576,6 +602,7 @@ fn resolve_container_program(program: &OsString) -> OsString {
     }
     program.clone()
 }
+
 fn rewrite_display_command_for_container(base_command: String) -> String {
     let mut parts = base_command.splitn(2, ' ');
     let Some(program) = parts.next() else {
@@ -594,6 +621,7 @@ fn rewrite_display_command_for_container(base_command: String) -> String {
         None => rewritten_program,
     }
 }
+
 fn rewrite_workspace_arg_paths(
     args: &[OsString],
     source_root: &Path,
@@ -623,6 +651,7 @@ fn rewrite_workspace_arg_paths(
     }
     rewritten
 }
+
 fn rewrite_workspace_path_value(
     value: &OsString,
     source_root: &Path,
@@ -637,6 +666,7 @@ fn rewrite_workspace_path_value(
     }
     value.clone()
 }
+
 fn maybe_add_env_mount(mounts: &mut BTreeSet<PathBuf>, value: &OsString) {
     let path = Path::new(value);
     if !path.is_absolute() {
@@ -653,6 +683,7 @@ fn maybe_add_env_mount(mounts: &mut BTreeSet<PathBuf>, value: &OsString) {
         mounts.insert(candidate);
     }
 }
+
 fn prepare_mount_target(container: &Path, host: &Path) -> Result<()> {
     let metadata = fs::metadata(host)
         .with_context(|| format!("failed to stat mount source {}", host.display()))?;
@@ -669,6 +700,7 @@ fn prepare_mount_target(container: &Path, host: &Path) -> Result<()> {
     }
     Ok(())
 }
+
 fn copy_path(source: PathBuf, destination: PathBuf) -> Result<()> {
     if is_ignorable_rust_incremental_lock(&source) {
         return Ok(());
@@ -707,6 +739,7 @@ fn copy_path(source: PathBuf, destination: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to set permissions on {}", destination.display()))?;
     Ok(())
 }
+
 fn sync_path_back(source: &Path, destination: &Path) -> Result<()> {
     if !source.exists() && fs::symlink_metadata(source).is_err() {
         if destination.exists() || fs::symlink_metadata(destination).is_ok() {
@@ -737,6 +770,7 @@ fn sync_path_back(source: &Path, destination: &Path) -> Result<()> {
     remove_existing_path(destination).ok();
     copy_path(source.to_path_buf(), destination.to_path_buf())
 }
+
 fn remove_existing_path(path: &Path) -> Result<()> {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return Ok(());
@@ -750,6 +784,7 @@ fn remove_existing_path(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
 fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
     let target = fs::read_link(source)
         .with_context(|| format!("failed to read symlink {}", source.display()))?;
@@ -774,3 +809,7 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "sandbox_tests.rs"]
+mod tests;
