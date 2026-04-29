@@ -2,7 +2,9 @@ use crate::live_summary_formatter::LiveSummaryFormatter;
 use crate::summary::{format_tool_input_preview, JsonSummary, ToolCallRecord};
 use rust_debug::tracing::info;
 use serde_json::Value;
+
 const LIVE_SUMMARY_FORMATTER: LiveSummaryFormatter = LiveSummaryFormatter::new("Agent");
+
 pub fn compute_cost(
     model: Option<&str>,
     input_tokens: u64,
@@ -47,6 +49,7 @@ pub fn compute_cost(
         + (cache_read_tokens as f64 / million) * cache_read_rate
         + (output_tokens as f64 / million) * output_rate
 }
+
 fn merge_tools(tools_used: &mut Vec<String>, json: &Value) {
     let Some(content) = json
         .get("message")
@@ -70,10 +73,12 @@ fn merge_tools(tools_used: &mut Vec<String>, json: &Value) {
         }
     }
 }
+
 fn tool_input_preview(name: &str, input: &Value) -> String {
     let _ = name;
     format_tool_input_preview(name, input)
 }
+
 fn extract_tool_calls(tool_calls: &mut Vec<ToolCallRecord>, json: &Value) {
     let Some(message) = json.get("message") else {
         return;
@@ -140,6 +145,7 @@ fn extract_tool_calls(tool_calls: &mut Vec<ToolCallRecord>, json: &Value) {
         });
     }
 }
+
 pub fn generate_json_line_summary(json_line: &str, current_model: Option<&str>) -> String {
     if let Ok(json) = serde_json::from_str::<Value>(json_line) {
         if let Some(msg_type) = json.get("type").and_then(|value| value.as_str()) {
@@ -220,6 +226,7 @@ pub fn generate_json_line_summary(json_line: &str, current_model: Option<&str>) 
         LIVE_SUMMARY_FORMATTER.bullet_line("Non-JSON response")
     }
 }
+
 fn summarize_tool_calls(json: &Value) -> Option<String> {
     let content = json.get("message")?.get("content")?.as_array()?;
 
@@ -240,6 +247,7 @@ fn summarize_tool_calls(json: &Value) -> Option<String> {
         Some(calls.join(", "))
     }
 }
+
 pub fn update_summary_from_event(summary: &mut JsonSummary, json: &Value) {
     if summary.session_id.is_none() {
         summary.session_id = json
@@ -323,5 +331,110 @@ pub fn update_summary_from_event(summary: &mut JsonSummary, json: &Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        compute_cost, generate_json_line_summary, tool_input_preview, update_summary_from_event,
+    };
+    use crate::summary::JsonSummary;
+    use serde_json::json;
+
+    #[test]
+    fn single_tool_call_keeps_message_usage() {
+        let mut summary = JsonSummary::new();
+        update_summary_from_event(
+            &mut summary,
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "cache_creation_input_tokens": 30,
+                        "cache_read_input_tokens": 40
+                    },
+                    "content": [
+                        {"type": "tool_use", "name": "bash", "input": {"command": "pwd"}}
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(summary.pending_tool_calls.len(), 1);
+        assert_eq!(summary.pending_tool_calls[0].input_tokens, 10);
+        assert_eq!(summary.pending_tool_calls[0].output_tokens, 20);
+    }
+
+    #[test]
+    fn multiple_tool_calls_do_not_duplicate_message_usage() {
+        let mut summary = JsonSummary::new();
+        update_summary_from_event(
+            &mut summary,
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "cache_creation_input_tokens": 30,
+                        "cache_read_input_tokens": 40
+                    },
+                    "content": [
+                        {"type": "tool_use", "name": "bash", "input": {"command": "pwd"}},
+                        {"type": "tool_use", "name": "read", "input": {"file_path": "/tmp/x"}}
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(summary.pending_tool_calls.len(), 2);
+        assert_eq!(summary.pending_tool_calls[0].input_tokens, 0);
+        assert_eq!(summary.pending_tool_calls[1].output_tokens, 0);
+    }
+
+    #[test]
+    fn compute_cost_matches_mixed_case_model_names() {
+        let opus_cost = compute_cost(Some("Claude-Opus-4-1"), 1_000_000, 0, 0, 0);
+        let haiku_cost = compute_cost(Some("CLAUDE-HAIKU-3"), 1_000_000, 0, 0, 0);
+
+        assert_eq!(opus_cost, 15.0);
+        assert_eq!(haiku_cost, 0.8);
+    }
+
+    #[test]
+    fn tool_input_preview_handles_multibyte_json_without_panicking() {
+        let preview = tool_input_preview("Edit", &json!("─".repeat(200)));
+        assert!(preview.ends_with("..."));
+        assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn claude_live_tool_summary_restores_short_bash_truncation() {
+        let summary = generate_json_line_summary(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-sonnet-4",
+                    "usage": {"output_tokens": 0},
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "bash",
+                        "input": {
+                            "command": "012345678901234567890123456789012345678901234567890123456789"
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+            None,
+        );
+
+        assert_eq!(
+            summary,
+            "Sonnet | Bash `012345678901234567890123456789012345678901234567890123456...`"
+        );
     }
 }
