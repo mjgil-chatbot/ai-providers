@@ -3,9 +3,11 @@ use std::io::BufRead;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+
 use anyhow::Result;
 use rust_debug::tracing::{debug, error, info, warn};
 use serde_json::Value;
+
 use crate::claude::response::{generate_json_line_summary, update_summary_from_event};
 use crate::config::{add_prompt_arg, has_mcp_servers, prompt_needs_hyphen_guard, ClaudeCliConfig};
 use crate::memory::{build_query_with_memory, MemoryContext};
@@ -14,22 +16,27 @@ use crate::session::ProviderSession;
 use crate::stream::{self, ErrorContexts, StreamMessage};
 use crate::summary::JsonSummary;
 use crate::workspace;
+
 const STDERR_TAIL_MAX_LINES: usize = 120;
+
 fn claude_transport_base_url(config: &ClaudeCliConfig) -> Option<&str> {
     config
         .extra_env
         .iter()
         .find_map(|(key, value)| (key == "ANTHROPIC_BASE_URL").then_some(value.as_str()))
 }
+
 fn uses_minimax_transport(config: &ClaudeCliConfig) -> bool {
     claude_transport_base_url(config).is_some_and(|base_url| base_url.contains("minimax.io"))
         || config.model.to_ascii_lowercase().contains("minimax")
 }
+
 fn global_claude_md_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .map(|home| home.join(".claude").join("CLAUDE.md"))
 }
+
 fn workspace_instruction_paths_for_session(
     session: Option<&ProviderSession>,
 ) -> Vec<std::path::PathBuf> {
@@ -47,6 +54,7 @@ fn workspace_instruction_paths_for_session(
 
     paths
 }
+
 fn load_claude_md_instructions(session: Option<&ProviderSession>) -> Option<String> {
     let mut sections = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -82,6 +90,7 @@ fn load_claude_md_instructions(session: Option<&ProviderSession>) -> Option<Stri
 
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
+
 pub fn effective_claude_system_prompt(
     config: &ClaudeCliConfig,
     session: Option<&ProviderSession>,
@@ -107,6 +116,7 @@ pub fn effective_claude_system_prompt(
 
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
+
 pub fn build_claude_command_string(
     system_prompt: Option<&str>,
     session: Option<&ProviderSession>,
@@ -143,6 +153,7 @@ pub fn build_claude_command_string(
     }
     wrap_command_string_with_runsc(parts.join(" "), None, config.runsc_image.as_deref())
 }
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubscriptionType {
     Max,
@@ -150,11 +161,13 @@ pub enum SubscriptionType {
     Api,
     Unknown,
 }
+
 impl SubscriptionType {
     pub fn is_subscription(&self) -> bool {
         matches!(self, SubscriptionType::Max | SubscriptionType::Pro)
     }
 }
+
 pub fn get_subscription_type(config: &ClaudeCliConfig) -> SubscriptionType {
     if let Some(subscription) = get_subscription_from_credentials_json(config)
         .or_else(|| get_subscription_from_claude_json(config))
@@ -166,6 +179,7 @@ pub fn get_subscription_type(config: &ClaudeCliConfig) -> SubscriptionType {
     }
     SubscriptionType::Unknown
 }
+
 fn get_subscription_from_credentials_json(config: &ClaudeCliConfig) -> Option<SubscriptionType> {
     let path = if let Some(config_dir) = config.config_dir.as_ref() {
         config_dir.join(".credentials.json")
@@ -176,6 +190,7 @@ fn get_subscription_from_credentials_json(config: &ClaudeCliConfig) -> Option<Su
     let content = std::fs::read_to_string(path).ok()?;
     parse_subscription_from_json(&content)
 }
+
 fn get_subscription_from_claude_json(config: &ClaudeCliConfig) -> Option<SubscriptionType> {
     let path = if let Some(config_dir) = config.config_dir.as_ref() {
         config_dir.join(".claude.json")
@@ -187,6 +202,7 @@ fn get_subscription_from_claude_json(config: &ClaudeCliConfig) -> Option<Subscri
     let json: Value = serde_json::from_str(&content).ok()?;
     parse_claude_json_subscription(&json)
 }
+
 fn parse_claude_json_subscription(json: &Value) -> Option<SubscriptionType> {
     let has_subscription = json
         .get("hasAvailableSubscription")
@@ -207,6 +223,7 @@ fn parse_claude_json_subscription(json: &Value) -> Option<SubscriptionType> {
         None
     }
 }
+
 fn parse_subscription_from_json(json_str: &str) -> Option<SubscriptionType> {
     let json: Value = serde_json::from_str(json_str).ok()?;
     let subscription_type = json
@@ -220,6 +237,7 @@ fn parse_subscription_from_json(json_str: &str) -> Option<SubscriptionType> {
         _ => None,
     }
 }
+
 pub fn call_claude_cli_stream(
     query: &str,
     system_prompt: Option<&str>,
@@ -552,4 +570,189 @@ pub fn call_claude_cli_stream(
         is_final: true,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_claude_command_string_includes_json_schema_flag() {
+        let config = ClaudeCliConfig {
+            cli: "claude".to_string(),
+            model: "claude-opus-4-7".to_string(),
+            json_schema: Some(
+                "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}}}"
+                    .to_string(),
+            ),
+            output_format: "stream-json".to_string(),
+            skip_permissions: true,
+            verbose_output: true,
+            allow_api_billing: false,
+            config_dir: None,
+            require_mcp_servers: false,
+            extra_env: Vec::new(),
+            runsc_image: None,
+            runsc_workspace_includes: Vec::new(),
+            runsc_mounts: Vec::new(),
+        };
+
+        let command =
+            build_claude_command_string(Some("system"), None, None, "Return JSON only", &config);
+
+        assert!(command.contains("--json-schema"));
+        assert!(command.contains("summary"));
+    }
+
+    #[test]
+    fn effective_claude_system_prompt_adds_claude_md_for_minimax_resume() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let claude_dir = temp_home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "global rule").unwrap();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let prompt = effective_claude_system_prompt(
+            &ClaudeCliConfig {
+                extra_env: vec![(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://api.minimax.io/anthropic".to_string(),
+                )],
+                ..ClaudeCliConfig::default()
+            },
+            None,
+            Some("session rule"),
+            true,
+        );
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(prompt.as_deref(), Some("global rule"));
+    }
+
+    #[test]
+    fn effective_claude_system_prompt_appends_workspace_instructions_after_global() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let claude_dir = temp_home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "global rule").unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("CLAUDE.md"), "workspace rule").unwrap();
+        let workspace_claude_dir = workspace.path().join(".claude");
+        std::fs::create_dir_all(&workspace_claude_dir).unwrap();
+        std::fs::write(
+            workspace_claude_dir.join("CLAUDE.md"),
+            "workspace nested rule",
+        )
+        .unwrap();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let session = ProviderSession {
+            working_dir: Some(workspace.path().to_string_lossy().into_owned()),
+            claude_session_id: None,
+            glm_session_id: None,
+            minimax_session_id: None,
+            qwen_session_id: None,
+            codex_session_id: None,
+            nemotron_session_id: None,
+            gemini_session_id: None,
+            openrouter_session_id: None,
+            omniforge_session_id: None,
+            kimi_session_id: None,
+            messages: Vec::new(),
+        };
+
+        let prompt = effective_claude_system_prompt(
+            &ClaudeCliConfig {
+                extra_env: vec![(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://api.minimax.io/anthropic".to_string(),
+                )],
+                ..ClaudeCliConfig::default()
+            },
+            Some(&session),
+            Some("session rule"),
+            true,
+        );
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            prompt.as_deref(),
+            Some("global rule\n\nworkspace rule\n\nworkspace nested rule")
+        );
+    }
+
+    #[test]
+    fn build_claude_command_string_keeps_workspace_instructions_on_minimax_resume() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let claude_dir = temp_home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("CLAUDE.md"), "global rule").unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("CLAUDE.md"), "workspace rule").unwrap();
+        let workspace_claude_dir = workspace.path().join(".claude");
+        std::fs::create_dir_all(&workspace_claude_dir).unwrap();
+        std::fs::write(
+            workspace_claude_dir.join("CLAUDE.md"),
+            "workspace nested rule",
+        )
+        .unwrap();
+
+        let previous_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+        let session = ProviderSession {
+            working_dir: Some(workspace.path().to_string_lossy().into_owned()),
+            claude_session_id: None,
+            glm_session_id: None,
+            minimax_session_id: Some("resume-1".to_string()),
+            qwen_session_id: None,
+            codex_session_id: None,
+            nemotron_session_id: None,
+            gemini_session_id: None,
+            openrouter_session_id: None,
+            omniforge_session_id: None,
+            kimi_session_id: None,
+            messages: Vec::new(),
+        };
+
+        let command = build_claude_command_string(
+            Some("session rule"),
+            Some(&session),
+            Some("resume-1"),
+            "continue",
+            &ClaudeCliConfig {
+                cli: "claude".to_string(),
+                model: "MiniMax-M2.7".to_string(),
+                output_format: "stream-json".to_string(),
+                extra_env: vec![(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://api.minimax.io/anthropic".to_string(),
+                )],
+                ..ClaudeCliConfig::default()
+            },
+        );
+
+        match previous_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(command.contains(
+            "--append-system-prompt \"global rule\n\nworkspace rule\n\nworkspace nested rule\""
+        ));
+        assert!(!command.contains("session rule"));
+    }
 }
