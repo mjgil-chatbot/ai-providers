@@ -5,9 +5,11 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+
 use anyhow::Result;
 use rust_debug::tracing::{error, info, warn};
 use serde_json::Value;
+
 use crate::config::{add_prompt_arg, format_prompt_arg, GeminiCliConfig};
 use crate::live_summary_formatter::LiveSummaryFormatter;
 use crate::memory::{build_query_with_memory, MemoryContext};
@@ -16,8 +18,10 @@ use crate::session::ProviderSession;
 use crate::stream::{self, ErrorContexts, StreamMessage};
 use crate::summary::{format_tool_input_preview, JsonSummary, ToolCallRecord};
 use crate::workspace;
+
 const STDERR_TAIL_MAX_LINES: usize = 120;
 const LIVE_SUMMARY_FORMATTER: LiveSummaryFormatter = LiveSummaryFormatter::new("Gemini");
+
 fn build_gemini_prompt(
     system_prompt: Option<&str>,
     query: &str,
@@ -68,10 +72,12 @@ fn build_gemini_prompt(
     }
     sections.join("\n\n")
 }
+
 fn is_disallowed_gemini_include_dir(dir: &str) -> bool {
     let trimmed = dir.trim();
     trimmed.is_empty() || (!cfg!(windows) && Path::new(trimmed) == Path::new("/"))
 }
+
 fn fallback_gemini_include_directory(session: Option<&ProviderSession>) -> Option<String> {
     workspace::session_working_dir(session)
         .filter(|dir| !is_disallowed_gemini_include_dir(dir))
@@ -86,6 +92,7 @@ fn fallback_gemini_include_directory(session: Option<&ProviderSession>) -> Optio
             })
         })
 }
+
 fn gemini_include_directories(
     session: Option<&ProviderSession>,
     config: &GeminiCliConfig,
@@ -116,6 +123,7 @@ fn gemini_include_directories(
             .collect()
     }
 }
+
 pub fn build_gemini_command_string(
     system_prompt: Option<&str>,
     query: &str,
@@ -152,6 +160,7 @@ pub fn build_gemini_command_string(
         config.runsc_image.as_deref(),
     )
 }
+
 pub fn call_gemini_cli_stream(
     query: &str,
     system_prompt: Option<&str>,
@@ -398,6 +407,7 @@ pub fn call_gemini_cli_stream(
     });
     Ok(())
 }
+
 fn generate_gemini_line_summary(json: &Value, current_model: Option<&str>) -> String {
     match json.get("type").and_then(|value| value.as_str()) {
         Some("init") => LIVE_SUMMARY_FORMATTER.started_line(
@@ -416,6 +426,7 @@ fn generate_gemini_line_summary(json: &Value, current_model: Option<&str>) -> St
         _ => String::new(),
     }
 }
+
 fn extract_gemini_message_content(json: &Value) -> Option<String> {
     if let Some(content) = json.get("content").and_then(|value| value.as_str()) {
         return Some(content.to_string());
@@ -436,6 +447,7 @@ fn extract_gemini_message_content(json: &Value) -> Option<String> {
     }
     None
 }
+
 fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         if let Some(value) = value.get(*key).and_then(|value| value.as_u64()) {
@@ -444,6 +456,7 @@ fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     }
     None
 }
+
 fn record_gemini_tool_call(summary: &mut JsonSummary, json: &Value) {
     let Some(record) = extract_gemini_tool_call(json) else {
         return;
@@ -453,6 +466,7 @@ fn record_gemini_tool_call(summary: &mut JsonSummary, json: &Value) {
     }
     summary.pending_tool_calls.push(record);
 }
+
 fn extract_gemini_tool_call(json: &Value) -> Option<ToolCallRecord> {
     let name = json.get("name").and_then(|value| value.as_str())?;
     Some(ToolCallRecord {
@@ -460,4 +474,68 @@ fn extract_gemini_tool_call(json: &Value) -> Option<ToolCallRecord> {
         input_preview: format_tool_input_preview(name, json),
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_gemini_prompt, gemini_include_directories, generate_gemini_line_summary};
+    use crate::config::GeminiCliConfig;
+    use crate::session::{ProviderMessage, ProviderSession};
+    use serde_json::json;
+
+    #[test]
+    fn prompt_replay_keeps_full_assistant_message() {
+        let session = ProviderSession {
+            messages: vec![
+                ProviderMessage {
+                    content: "Initial question".to_string(),
+                    is_user: true,
+                    history_content: None,
+                },
+                ProviderMessage {
+                    content: "First paragraph.\n\n```rust\nfn main() {}\n```\n\nFinal paragraph."
+                        .to_string(),
+                    is_user: false,
+                    history_content: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let prompt = build_gemini_prompt(None, "Follow-up", Some(&session), false, None);
+
+        assert!(prompt.contains("First paragraph."));
+        assert!(prompt.contains("fn main() {}"));
+        assert!(prompt.contains("Final paragraph."));
+    }
+
+    #[test]
+    fn include_directories_filters_root_and_falls_back_to_session_workspace() {
+        let session = ProviderSession {
+            working_dir: Some("/tmp/gemini-workspace".to_string()),
+            ..Default::default()
+        };
+        let config = GeminiCliConfig {
+            include_directories: vec!["/".to_string()],
+            extra_env: Vec::new(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            gemini_include_directories(Some(&session), &config),
+            vec!["/tmp/gemini-workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn gemini_line_summary_uses_shared_model_labeling() {
+        let summary = generate_gemini_line_summary(
+            &json!({
+                "type": "init",
+                "model": "gpt-5.4-high"
+            }),
+            None,
+        );
+        assert_eq!(summary, "GPT-5.4-High agent started");
+    }
 }
