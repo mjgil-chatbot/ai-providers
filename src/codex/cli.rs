@@ -3,9 +3,11 @@ use std::io::BufRead;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+
 use anyhow::Result;
 use rust_debug::tracing::{error, info, warn};
 use serde_json::Value;
+
 use super::live_summary::{compose_live_response, generate_codex_line_summary};
 use super::session_store::select_codex_home_for_resume;
 use crate::claude::compute_cost;
@@ -16,7 +18,9 @@ use crate::session::ProviderSession;
 use crate::stream::{self, ErrorContexts, StreamMessage};
 use crate::summary::{format_tool_input_preview, JsonSummary, ToolCallRecord};
 use crate::workspace;
+
 const STDERR_TAIL_MAX_LINES: usize = 120;
+
 fn configured_codex_home(config: &CodexCliConfig) -> Option<std::path::PathBuf> {
     config
         .extra_env
@@ -24,6 +28,7 @@ fn configured_codex_home(config: &CodexCliConfig) -> Option<std::path::PathBuf> 
         .find(|(key, _)| key == "CODEX_HOME")
         .map(|(_, value)| std::path::PathBuf::from(value))
 }
+
 fn build_codex_prompt(
     system_prompt: Option<&str>,
     query: &str,
@@ -44,6 +49,7 @@ fn build_codex_prompt(
         _ => effective_query,
     }
 }
+
 pub fn build_codex_command_string(
     system_prompt: Option<&str>,
     session_id: Option<&str>,
@@ -79,6 +85,7 @@ pub fn build_codex_command_string(
     parts.push(format!("\"{}\"", prompt));
     wrap_command_string_with_runsc(parts.join(" "), working_dir, config.runsc_image.as_deref())
 }
+
 pub fn call_codex_cli_stream(
     query: &str,
     system_prompt: Option<&str>,
@@ -338,6 +345,7 @@ pub fn call_codex_cli_stream(
     });
     Ok(())
 }
+
 fn extract_codex_item_text(item: &Value) -> Option<String> {
     item.get("text")
         .and_then(|value| value.as_str())
@@ -355,6 +363,7 @@ fn extract_codex_item_text(item: &Value) -> Option<String> {
                 .filter(|value| !value.is_empty())
         })
 }
+
 fn record_codex_tool_call(summary: &mut JsonSummary, item: &Value) {
     let name = item
         .get("call")
@@ -372,6 +381,7 @@ fn record_codex_tool_call(summary: &mut JsonSummary, item: &Value) {
         ..Default::default()
     });
 }
+
 fn handle_completed_item(summary: &mut JsonSummary, item: &Value, response_content: &mut String) {
     let item_type = item.get("type").and_then(|value| value.as_str());
     if item_type == Some("agent_message") {
@@ -386,6 +396,7 @@ fn handle_completed_item(summary: &mut JsonSummary, item: &Value, response_conte
         summary.num_compactions += 1;
     }
 }
+
 fn update_summary_from_turn(summary: &mut JsonSummary, json: &Value) {
     summary.response_count += 1;
     let mut input_tokens = summary.total_input_tokens;
@@ -450,4 +461,240 @@ fn update_summary_from_turn(summary: &mut JsonSummary, json: &Value) {
         .get("duration_ms")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completed_context_compaction_items_increment_compaction_count() {
+        let mut summary = JsonSummary::new();
+        let mut response_content = String::new();
+
+        handle_completed_item(
+            &mut summary,
+            &json!({
+                "type": "context_compaction"
+            }),
+            &mut response_content,
+        );
+
+        assert_eq!(summary.num_compactions, 1);
+        assert!(response_content.is_empty());
+    }
+
+    #[test]
+    fn turn_completed_uses_estimated_token_count_as_current_context() {
+        let mut summary = JsonSummary::new();
+        summary.model = Some("gpt-5.4".to_string());
+
+        update_summary_from_turn(
+            &mut summary,
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 300,
+                    "cache_creation_input_tokens": 40,
+                    "cache_read_input_tokens": 100
+                },
+                "estimated_token_count": 171879,
+                "auto_compact_limit": 244800,
+                "token_limit_reached": false,
+                "duration_ms": 1500
+            }),
+        );
+
+        assert_eq!(summary.total_input_tokens, 1200);
+        assert_eq!(summary.total_output_tokens, 300);
+        assert_eq!(summary.cache_creation_tokens, 40);
+        assert_eq!(summary.cache_read_tokens, 100);
+        assert_eq!(summary.context_window_tokens, 171_879);
+        // auto_compact_limit 244800 / 0.95 ≈ 257684
+        assert_eq!(summary.context_window_size, 257_684);
+        assert_eq!(summary.response_count, 1);
+        assert_eq!(summary.total_duration_ms, 1500);
+    }
+
+    #[test]
+    fn turn_completed_prefers_model_context_window_over_auto_compact_limit() {
+        let mut summary = JsonSummary::new();
+
+        update_summary_from_turn(
+            &mut summary,
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 100
+                },
+                "estimated_token_count": 6000,
+                "model_context_window": 258400,
+                "auto_compact_limit": 244800,
+                "duration_ms": 200
+            }),
+        );
+
+        assert_eq!(summary.context_window_tokens, 6_000);
+        assert_eq!(summary.context_window_size, 258_400);
+    }
+
+    #[test]
+    fn turn_completed_without_estimated_token_count_preserves_existing_context() {
+        let mut summary = JsonSummary::new();
+        summary.context_window_tokens = 50_000;
+
+        update_summary_from_turn(
+            &mut summary,
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200
+                },
+                "model_context_window": 258400,
+                "duration_ms": 100
+            }),
+        );
+
+        // Without estimated_token_count, existing value should be preserved
+        assert_eq!(summary.context_window_tokens, 50_000);
+        assert_eq!(summary.context_window_size, 258_400);
+    }
+
+    #[test]
+    fn turn_completed_accumulates_context_across_multiple_turns() {
+        let mut summary = JsonSummary::new();
+
+        // First turn
+        update_summary_from_turn(
+            &mut summary,
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 200
+                },
+                "estimated_token_count": 9152,
+                "auto_compact_limit": 244800,
+                "duration_ms": 500
+            }),
+        );
+
+        assert_eq!(summary.context_window_tokens, 9_152);
+        assert_eq!(summary.context_window_size, 257_684);
+
+        // Second turn — context grows
+        update_summary_from_turn(
+            &mut summary,
+            &json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 2000,
+                    "output_tokens": 400
+                },
+                "estimated_token_count": 18341,
+                "auto_compact_limit": 244800,
+                "duration_ms": 600
+            }),
+        );
+
+        assert_eq!(summary.context_window_tokens, 18_341);
+        assert_eq!(summary.response_count, 2);
+        assert_eq!(summary.total_duration_ms, 1100);
+    }
+
+    #[test]
+    fn build_codex_command_string_skips_git_repo_check_in_runsc_mode() {
+        let config = CodexCliConfig {
+            cli: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            output_schema: None,
+            json_stream: true,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            force_skip_git_repo_check: false,
+            skip_git_repo_check_prefixes: Vec::new(),
+            extra_env: Vec::new(),
+            runsc_image: Some("runsc-image:latest".to_string()),
+            runsc_workspace_includes: Vec::new(),
+            runsc_mounts: Vec::new(),
+        };
+
+        let command =
+            build_codex_command_string(None, None, "draft prompt", Some("/tmp/workspace"), &config);
+
+        assert!(command.contains("--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn build_codex_command_string_skips_git_repo_check_when_forced() {
+        let config = CodexCliConfig {
+            cli: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            output_schema: None,
+            json_stream: true,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            force_skip_git_repo_check: true,
+            skip_git_repo_check_prefixes: Vec::new(),
+            extra_env: Vec::new(),
+            runsc_image: None,
+            runsc_workspace_includes: Vec::new(),
+            runsc_mounts: Vec::new(),
+        };
+
+        let command =
+            build_codex_command_string(None, None, "draft prompt", Some("/tmp/non-repo"), &config);
+
+        assert!(command.contains("--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn build_codex_command_string_skips_git_repo_check_by_default() {
+        let config = CodexCliConfig {
+            cli: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            output_schema: None,
+            json_stream: true,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            force_skip_git_repo_check: false,
+            skip_git_repo_check_prefixes: Vec::new(),
+            extra_env: Vec::new(),
+            runsc_image: None,
+            runsc_workspace_includes: Vec::new(),
+            runsc_mounts: Vec::new(),
+        };
+
+        let command =
+            build_codex_command_string(None, None, "draft prompt", Some("/tmp/workspace"), &config);
+
+        assert!(command.contains("--skip-git-repo-check"));
+    }
+
+    #[test]
+    fn build_codex_command_string_includes_output_schema_flag() {
+        let config = CodexCliConfig {
+            cli: "codex".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            output_schema: Some(std::path::PathBuf::from("/tmp/contract-schema.json")),
+            json_stream: true,
+            reasoning_effort: None,
+            sandbox_mode: None,
+            force_skip_git_repo_check: false,
+            skip_git_repo_check_prefixes: Vec::new(),
+            extra_env: Vec::new(),
+            runsc_image: None,
+            runsc_workspace_includes: Vec::new(),
+            runsc_mounts: Vec::new(),
+        };
+
+        let command =
+            build_codex_command_string(None, None, "draft prompt", Some("/tmp/workspace"), &config);
+
+        assert!(command.contains("--output-schema /tmp/contract-schema.json"));
+    }
 }
