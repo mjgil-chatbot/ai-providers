@@ -4,9 +4,11 @@ use std::io::BufRead;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
+
 use anyhow::Result;
 use rust_debug::tracing::{error, info, warn};
 use serde_json::Value;
+
 use crate::config::{add_prompt_arg, format_prompt_arg, KimiCliConfig};
 use crate::live_summary_formatter::LiveSummaryFormatter;
 use crate::memory::{build_query_with_memory, MemoryContext};
@@ -15,8 +17,10 @@ use crate::session::ProviderSession;
 use crate::stream::{self, ErrorContexts, StreamMessage};
 use crate::summary::{JsonSummary, ToolCallRecord};
 use crate::workspace;
+
 const STDERR_TAIL_MAX_LINES: usize = 120;
 const LIVE_SUMMARY_FORMATTER: LiveSummaryFormatter = LiveSummaryFormatter::new("Kimi");
+
 fn build_kimi_prompt(
     system_prompt: Option<&str>,
     query: &str,
@@ -65,6 +69,7 @@ fn build_kimi_prompt(
     }
     sections.join("\n\n")
 }
+
 pub fn build_kimi_command_string(
     system_prompt: Option<&str>,
     query: &str,
@@ -99,6 +104,7 @@ pub fn build_kimi_command_string(
         config.runsc_image.as_deref(),
     )
 }
+
 pub fn call_kimi_cli_stream(
     query: &str,
     system_prompt: Option<&str>,
@@ -297,6 +303,7 @@ pub fn call_kimi_cli_stream(
     });
     Ok(())
 }
+
 fn extract_kimi_text_content(json: &Value) -> Option<String> {
     let role = json.get("role")?.as_str()?;
     if role != "assistant" {
@@ -326,6 +333,7 @@ fn extract_kimi_text_content(json: &Value) -> Option<String> {
         Some(out)
     }
 }
+
 fn extract_kimi_tool_call(json: &Value) -> Option<ToolCallRecord> {
     let role = json.get("role")?.as_str()?;
     if role != "assistant" {
@@ -341,6 +349,7 @@ fn extract_kimi_tool_call(json: &Value) -> Option<ToolCallRecord> {
         ..Default::default()
     })
 }
+
 fn extract_kimi_tool_call_details(json: &Value) -> Vec<String> {
     let role = json.get("role").and_then(|v| v.as_str());
     if role != Some("assistant") {
@@ -363,6 +372,7 @@ fn extract_kimi_tool_call_details(json: &Value) -> Vec<String> {
         })
         .collect()
 }
+
 fn parse_kimi_tool_arguments(arguments: &Value) -> Value {
     match arguments {
         Value::String(text) => serde_json::from_str::<Value>(text).unwrap_or_else(|_| {
@@ -373,6 +383,7 @@ fn parse_kimi_tool_arguments(arguments: &Value) -> Value {
         _ => arguments.clone(),
     }
 }
+
 /// Format a Kimi tool name into a human-readable label.
 /// e.g. "ReadFile" -> "Read File", "StrReplaceFile" -> "Str Replace File"
 fn format_kimi_tool_name(name: &str) -> String {
@@ -392,6 +403,7 @@ fn format_kimi_tool_name(name: &str) -> String {
         .collect::<String>();
     formatted.trim().to_string()
 }
+
 fn generate_kimi_line_summary(json: &Value) -> String {
     let Some(role) = json.get("role").and_then(|v| v.as_str()) else {
         return String::new();
@@ -450,6 +462,7 @@ fn generate_kimi_line_summary(json: &Value) -> String {
         _ => String::new(),
     }
 }
+
 fn extract_kimi_session_id_from_stderr(stderr: &str) -> Option<String> {
     for line in stderr.lines() {
         if let Some(rest) = line.strip_prefix("To resume this session: kimi -r ") {
@@ -460,4 +473,94 @@ fn extract_kimi_session_id_from_stderr(stderr: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_kimi_prompt, extract_kimi_session_id_from_stderr, extract_kimi_text_content,
+        generate_kimi_line_summary,
+    };
+    use crate::session::ProviderSession;
+    use serde_json::json;
+
+    #[test]
+    fn parses_session_id_from_stderr() {
+        let stderr =
+            "Some log\nTo resume this session: kimi -r 0cb1ccdd-9b6b-4b2e-a11f-de9f4ba4aaaa\n";
+        assert_eq!(
+            extract_kimi_session_id_from_stderr(stderr),
+            Some("0cb1ccdd-9b6b-4b2e-a11f-de9f4ba4aaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_session_line() {
+        assert_eq!(extract_kimi_session_id_from_stderr("just logs"), None);
+    }
+
+    #[test]
+    fn suppresses_assistant_text_during_tool_turns() {
+        let json = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "The background agents were lost. Let me explore directly."}
+            ],
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "Shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                }
+            ]
+        });
+        assert_eq!(extract_kimi_text_content(&json), None);
+    }
+
+    #[test]
+    fn renders_tool_detail_with_command_preview() {
+        let json = json!({
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "Shell",
+                        "arguments": "{\"command\":\"pwd\"}"
+                    }
+                }
+            ]
+        });
+        assert_eq!(generate_kimi_line_summary(&json), "Kimi | Bash `pwd`");
+    }
+
+    #[test]
+    fn suppresses_empty_tool_result_lines() {
+        let json = json!({
+            "role": "tool",
+            "name": "Shell",
+            "content": ""
+        });
+        assert!(generate_kimi_line_summary(&json).is_empty());
+    }
+
+    #[test]
+    fn resumed_prompts_still_include_system_instructions() {
+        let session = ProviderSession {
+            kimi_session_id: Some("resume-session".to_string()),
+            ..Default::default()
+        };
+
+        let prompt = build_kimi_prompt(
+            Some("Do not use background agents."),
+            "Inspect the repo",
+            Some(&session),
+            true,
+            None,
+        );
+
+        assert!(prompt.contains("System instructions:\nDo not use background agents."));
+        assert!(prompt.contains("User: Inspect the repo"));
+        assert!(!prompt.contains("Conversation so far:"));
+    }
 }
