@@ -1,11 +1,14 @@
 use crate::summary::format_tool_input_preview;
 use serde_json::Value;
+
 const TOOL_COMMAND_PREVIEW_MAX_CHARS: usize = 57;
 const TOOL_GREP_PREVIEW_MAX_CHARS: usize = 37;
+
 #[derive(Clone, Copy)]
 pub struct LiveSummaryFormatter {
     fallback_model_label: &'static str,
 }
+
 impl LiveSummaryFormatter {
     pub const fn new(fallback_model_label: &'static str) -> Self {
         Self {
@@ -151,6 +154,7 @@ impl LiveSummaryFormatter {
         )
     }
 }
+
 fn friendly_model_label(model: &str, fallback: &str) -> String {
     let lower = model.to_ascii_lowercase();
     if model == "unknown" {
@@ -185,6 +189,7 @@ fn friendly_model_label(model: &str, fallback: &str) -> String {
     }
     model.to_string()
 }
+
 fn minimax_friendly_label(model_lower: &str) -> String {
     let version = if model_lower.contains("m2.7") {
         "2.7"
@@ -206,6 +211,7 @@ fn minimax_friendly_label(model_lower: &str) -> String {
 
     format!("MM-{}{}", version, hs)
 }
+
 fn mcp_tool_label(tool_name: &str) -> String {
     match tool_name
         .strip_prefix("mcp__")
@@ -215,6 +221,7 @@ fn mcp_tool_label(tool_name: &str) -> String {
         None => tool_name.to_string(),
     }
 }
+
 fn markdownify_tool_preview(preview: &str) -> String {
     if preview.trim().is_empty() {
         return String::new();
@@ -225,6 +232,7 @@ fn markdownify_tool_preview(preview: &str) -> String {
         .collect::<Vec<_>>()
         .join(" | ")
 }
+
 fn markdownify_preview_segment(segment: &str) -> String {
     match segment.split_once('=') {
         Some((key, value)) if !value.trim().is_empty() => {
@@ -233,6 +241,7 @@ fn markdownify_preview_segment(segment: &str) -> String {
         _ => markdown_inline_code(segment),
     }
 }
+
 fn markdown_inline_code(text: &str) -> String {
     if text.contains('`') {
         format!("`` {text} ``")
@@ -240,6 +249,7 @@ fn markdown_inline_code(text: &str) -> String {
         format!("`{text}`")
     }
 }
+
 fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -249,6 +259,7 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
         text.to_string()
     }
 }
+
 fn unwrap_shell_wrapper(command: &str) -> Option<&str> {
     for prefix in [
         "/bin/bash -lc ",
@@ -267,4 +278,62 @@ fn unwrap_shell_wrapper(command: &str) -> Option<&str> {
         return Some(rest);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveSummaryFormatter;
+    use serde_json::json;
+
+    #[test]
+    fn compose_response_places_summary_above_text() {
+        let formatter = LiveSummaryFormatter::new("Agent");
+        let rendered = formatter.compose_response("Agent | Bash `pwd`", "final answer");
+        assert_eq!(rendered, "Agent | Bash `pwd`\n\nfinal answer");
+    }
+
+    #[test]
+    fn gpt_54_high_label_is_preferred_over_generic_codex() {
+        let formatter = LiveSummaryFormatter::new("Codex");
+        let rendered = formatter.started_line(Some("gpt-5.4-high"));
+        assert_eq!(rendered, "GPT-5.4-High agent started");
+    }
+
+    #[test]
+    fn bash_tool_detail_unwraps_shell_wrapper() {
+        let formatter = LiveSummaryFormatter::new("Codex");
+        let detail = formatter.tool_detail(
+            "bash",
+            &json!({"command": "/bin/bash -lc 'git status --short --branch'"}),
+        );
+        assert_eq!(detail, "Bash `git status --short --branch`");
+    }
+
+    #[test]
+    fn bash_tool_detail_uses_shared_preview_limit() {
+        let formatter = LiveSummaryFormatter::new("Agent");
+        let detail = formatter.tool_detail(
+            "bash",
+            &json!({"command": "012345678901234567890123456789012345678901234567890123456789"}),
+        );
+        assert_eq!(
+            detail,
+            "Bash `012345678901234567890123456789012345678901234567890123456...`"
+        );
+    }
+
+    #[test]
+    fn mcp_preview_is_markdownified() {
+        let formatter = LiveSummaryFormatter::new("Codex");
+        let line = formatter.mcp_tool_line(
+            Some("gpt-5.4-high"),
+            "mcp__lightweight_builds__run_build",
+            &json!({
+                "project_path": "/tmp/project",
+                "command_override": ["cargo", "test", "--lib"]
+            }),
+        );
+        assert!(line.starts_with("GPT-5.4-High | MCP lightweight_builds.run_build "));
+        assert!(line.contains("project_path=`/tmp/project`"));
+    }
 }
