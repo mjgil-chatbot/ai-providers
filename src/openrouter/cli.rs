@@ -3,20 +3,26 @@ use std::io::BufRead;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+
 use anyhow::Result;
 use rust_debug::tracing::{error, info, warn};
 use serde_json::Value;
+
 use crate::config::OpenRouterConfig;
 use crate::memory::{build_query_with_memory, MemoryContext};
 use crate::session::ProviderSession;
 use crate::stream::{self, StreamMessage};
 use crate::summary::{format_tool_input_preview, JsonSummary, ToolCallRecord};
+
 use super::default_executor::default_executor;
 use super::tool_exec::parse_tool_call;
 pub use super::tool_exec::TextToolCall;
+
 /// Maximum number of agent loop iterations (tool call → result → next response).
 const MAX_TOOL_ITERATIONS: usize = 25;
+
 const STDERR_TAIL_MAX_LINES: usize = 120;
+
 /// Result of a single streaming turn.
 #[derive(Debug)]
 pub struct TurnResult {
@@ -29,6 +35,7 @@ pub struct TurnResult {
     /// Detected tool call, if any (caller executes this)
     pub tool_call: Option<(TextToolCall, String)>,
 }
+
 fn build_openrouter_prompt(
     system_prompt: Option<&str>,
     query: &str,
@@ -86,6 +93,7 @@ fn build_openrouter_prompt(
 
     messages
 }
+
 pub fn build_openrouter_command_string(
     system_prompt: Option<&str>,
     query: &str,
@@ -114,12 +122,14 @@ pub fn build_openrouter_command_string(
         config.base_url, "***", body
     )
 }
+
 /// Outcome of a single streaming API call.
 struct StreamOutcome {
     response_content: String,
     summary: JsonSummary,
     error: bool,
 }
+
 /// Make a single streaming API call with the given messages and collect the full
 /// response. Intermediate chunks are sent through `tx` so the UI can update in
 /// real time.
@@ -363,6 +373,7 @@ fn stream_one_turn(
         error: false,
     })
 }
+
 /// Execute a single streaming turn and return.
 ///
 /// This is a single-turn function: it makes one API call and returns the result.
@@ -389,16 +400,19 @@ pub fn stream_openrouter_turn(
         None,
     )
 }
+
 /// Result of tool execution (returned to the model for next turn).
 #[derive(Debug)]
 pub struct ToolExecResult {
     pub output: String,
     pub success: bool,
 }
+
 /// Callback for tool execution. The caller provides this to handle tool calls
 /// with their own permission enforcement. Returns the tool result to feed back
 /// to the model.
 pub type ToolExecutor = Box<dyn Fn(TextToolCall) -> ToolExecResult + Send + Sync>;
+
 fn sse_payload(line: &str) -> &str {
     let trimmed = line.trim();
     trimmed
@@ -406,6 +420,7 @@ fn sse_payload(line: &str) -> &str {
         .map(str::trim_start)
         .unwrap_or(trimmed)
 }
+
 fn stream_openrouter_turn_impl(
     query: &str,
     system_prompt: Option<&str>,
@@ -482,6 +497,7 @@ fn stream_openrouter_turn_impl(
         })
     }
 }
+
 /// Stream OpenRouter with tool execution using the provided executor.
 /// The executor callback handles tool execution - callers should provide their own
 /// for permission enforcement. For backward compatibility, use this with the
@@ -620,6 +636,7 @@ pub fn call_openrouter_stream_with_executor(
     });
     Ok(())
 }
+
 /// Stream OpenRouter with the default tool executor (no permission enforcement).
 /// For permission enforcement, use stream_openrouter_turn with a custom executor
 /// in the calling code.
@@ -642,4 +659,57 @@ pub fn call_openrouter_stream(
         stop_signal,
         default_executor(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_openrouter_prompt, sse_payload};
+    use crate::session::{ProviderMessage, ProviderSession};
+
+    #[test]
+    fn prompt_includes_system_and_history() {
+        let session = ProviderSession {
+            messages: vec![
+                ProviderMessage {
+                    content: "First question".to_string(),
+                    is_user: true,
+                    history_content: None,
+                },
+                ProviderMessage {
+                    content: "First answer.".to_string(),
+                    is_user: false,
+                    history_content: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let messages =
+            build_openrouter_prompt(Some("Be helpful"), "Follow-up", Some(&session), None, None);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Be helpful");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "First question");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "First answer.");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "Follow-up");
+    }
+
+    #[test]
+    fn prompt_without_system_or_history() {
+        let messages = build_openrouter_prompt(None, "Hello", None, None, None);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn sse_payload_accepts_data_prefix_with_or_without_space() {
+        assert_eq!(sse_payload("data: {\"x\":1}"), "{\"x\":1}");
+        assert_eq!(sse_payload("data:{\"x\":1}"), "{\"x\":1}");
+        assert_eq!(sse_payload("{\"x\":1}"), "{\"x\":1}");
+    }
 }
