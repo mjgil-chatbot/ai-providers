@@ -5,12 +5,14 @@
 //! executed by the caller with appropriate permission enforcement.
 
 use serde_json::Value;
+
 /// A parsed tool call from the model's text response.
 #[derive(Debug, Clone)]
 pub struct TextToolCall {
     pub tool: String,
     pub arguments: Value,
 }
+
 /// Scan the response text for a JSON tool call of the form:
 ///   {"tool": "<name>", "arguments": {...}}
 ///
@@ -42,6 +44,7 @@ pub fn parse_tool_call(response: &str) -> Option<(TextToolCall, &str)> {
     }
     None
 }
+
 /// Iterate over lines in `text`, yielding `(byte_offset, line_str)`.
 fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
     let mut offset = 0;
@@ -51,4 +54,37 @@ fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
         offset += line.len() + 1;
         (start, line)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_bash_call() {
+        let response = r#"I'll search for that pattern.
+{"tool": "bash", "arguments": {"command": "rg -n 'foo' src/"}}
+"#;
+        let (call, preamble) = parse_tool_call(response).unwrap();
+        assert_eq!(call.tool, "bash");
+        assert_eq!(
+            call.arguments.get("command").unwrap().as_str().unwrap(),
+            "rg -n 'foo' src/"
+        );
+        assert!(preamble.contains("search for that pattern"));
+    }
+
+    #[test]
+    fn parse_no_tool_call() {
+        let response = "Just a regular text response with no tools.";
+        assert!(parse_tool_call(response).is_none());
+    }
+
+    #[test]
+    fn parse_ignores_non_tool_json() {
+        let response = r#"Here's some config:
+{"name": "test", "version": "1.0"}
+No tool calls here."#;
+        assert!(parse_tool_call(response).is_none());
+    }
 }
