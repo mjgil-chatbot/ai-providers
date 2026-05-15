@@ -5,9 +5,12 @@ use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
 use rust_debug::tracing::{debug, error};
 use serde_json::Value;
+
 use crate::summary::JsonSummary;
+
 #[derive(Debug, Clone)]
 pub struct StreamMessage {
     pub response: String,
@@ -16,10 +19,12 @@ pub struct StreamMessage {
     pub summary: Option<JsonSummary>,
     pub is_final: bool,
 }
+
 pub struct KillerGuard {
     done: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
 impl KillerGuard {
     pub fn new(done: Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) -> Self {
         Self {
@@ -28,6 +33,7 @@ impl KillerGuard {
         }
     }
 }
+
 impl Drop for KillerGuard {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Relaxed);
@@ -36,17 +42,20 @@ impl Drop for KillerGuard {
         }
     }
 }
+
 pub struct CliProcess {
     child: Arc<Mutex<Child>>,
     _killer_guard: KillerGuard,
     stderr_handle: Option<std::thread::JoinHandle<String>>,
     stop_signal: Arc<AtomicBool>,
 }
+
 pub struct CliFinish {
     pub exit_status: Option<ExitStatus>,
     pub stderr_tail: String,
     pub wait_error: Option<String>,
 }
+
 impl CliProcess {
     pub fn spawn(
         cmd: &mut Command,
@@ -191,6 +200,7 @@ impl CliProcess {
         }
     }
 }
+
 fn terminate_child_process_group(child: &mut Child) {
     let pid = child.id() as libc::pid_t;
     if pid <= 0 {
@@ -213,12 +223,14 @@ fn terminate_child_process_group(child: &mut Child) {
     }
     let _ = child.kill();
 }
+
 pub struct ErrorContexts {
     pub stderr: String,
     pub stdout: String,
     pub response: String,
     pub error_detail: String,
 }
+
 impl ErrorContexts {
     pub fn build(
         stderr_tail: &str,
@@ -282,6 +294,69 @@ impl ErrorContexts {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorContexts;
+
+    #[test]
+    fn best_failure_detail_surfaces_wait_error() {
+        let contexts = ErrorContexts {
+            stderr: String::new(),
+            stdout: String::new(),
+            response: String::new(),
+            error_detail: String::new(),
+        };
+
+        let detail = contexts.best_failure_detail(None, Some("no child process"));
+
+        assert!(detail.contains("Failed to wait for child process"));
+        assert!(detail.contains("no child process"));
+    }
+
+    #[test]
+    fn extract_error_detail_surfaces_code_and_metadata() {
+        use super::extract_error_detail;
+        use serde_json::json;
+
+        // Basic message only
+        let basic = json!({"error": {"message": "Provider returned error"}});
+        assert_eq!(
+            extract_error_detail(&basic).unwrap(),
+            "Provider returned error"
+        );
+
+        // Message + HTTP code
+        let with_code = json!({"error": {"message": "Rate limit exceeded", "code": 429}});
+        let detail = extract_error_detail(&with_code).unwrap();
+        assert!(detail.contains("Rate limit exceeded"));
+        assert!(detail.contains("(HTTP 429)"));
+
+        // Message + code + metadata
+        let full = json!({
+            "error": {
+                "message": "Provider returned error",
+                "code": 502,
+                "metadata": {
+                    "provider_name": "Qwen",
+                    "raw": "upstream timeout"
+                }
+            }
+        });
+        let detail = extract_error_detail(&full).unwrap();
+        assert!(detail.contains("Provider returned error"));
+        assert!(detail.contains("(HTTP 502)"));
+        assert!(detail.contains("[provider: Qwen]"));
+        assert!(detail.contains("raw: upstream timeout"));
+
+        // String code variant
+        let str_code = json!({"error": {"message": "Forbidden", "code": "auth_error"}});
+        let detail = extract_error_detail(&str_code).unwrap();
+        assert!(detail.contains("Forbidden"));
+        assert!(detail.contains("(code: auth_error)"));
+    }
+}
+
 pub fn collect_stream_tail<R: BufRead>(reader: R, max_lines: usize) -> String {
     if max_lines == 0 {
         return String::new();
@@ -299,6 +374,7 @@ pub fn collect_stream_tail<R: BufRead>(reader: R, max_lines: usize) -> String {
     }
     tail.into_iter().collect::<Vec<_>>().join("\n")
 }
+
 pub fn tail_text_lines(text: &str, max_lines: usize) -> String {
     if max_lines == 0 || text.trim().is_empty() {
         return String::new();
@@ -313,11 +389,13 @@ pub fn tail_text_lines(text: &str, max_lines: usize) -> String {
     }
     tail.into_iter().collect::<Vec<_>>().join("\n")
 }
+
 pub fn join_stderr_thread(handle: Option<std::thread::JoinHandle<String>>) -> String {
     handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default()
 }
+
 pub fn extract_error_detail(json: &Value) -> Option<String> {
     if let Some(error) = json.get("error") {
         let mut parts: Vec<String> = Vec::new();
