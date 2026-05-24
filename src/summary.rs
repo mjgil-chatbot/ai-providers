@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub name: String,
@@ -15,6 +16,7 @@ pub struct ToolCallRecord {
     #[serde(default)]
     pub cache_read_tokens: u64,
 }
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnUsage {
     pub timestamp: String,
@@ -30,6 +32,7 @@ pub struct TurnUsage {
     #[serde(default)]
     pub tool_calls: Vec<ToolCallRecord>,
 }
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JsonSummary {
@@ -58,6 +61,7 @@ pub struct JsonSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonSummaryPreview {
     pub session_id: Option<String>,
@@ -78,14 +82,17 @@ pub struct JsonSummaryPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
+
 const PREVIEW_RECENT_TURNS: usize = 5;
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 120;
 static MCP_SERVER_COMMANDS: Mutex<Option<McpServerCommandCache>> = Mutex::new(None);
+
 #[derive(Clone, Debug)]
 struct McpServerCommandCache {
     path: PathBuf,
     commands: HashMap<String, String>,
 }
+
 impl JsonSummary {
     pub fn new() -> Self {
         Self::default()
@@ -165,6 +172,7 @@ impl JsonSummary {
         });
     }
 }
+
 pub fn format_tool_input_preview(name: &str, input: &Value) -> String {
     let normalized = resolve_tool_input_value(input).or_else(|| match input {
         Value::String(_) => Some(parse_embedded_json(input)),
@@ -183,6 +191,7 @@ pub fn format_tool_input_preview(name: &str, input: &Value) -> String {
     }
     truncate_with_ellipsis(&preview, TOOL_INPUT_PREVIEW_MAX_CHARS)
 }
+
 fn mcp_server_command_for_tool(tool_name: &str) -> Option<String> {
     let server_name = tool_name
         .strip_prefix("mcp__")
@@ -190,6 +199,7 @@ fn mcp_server_command_for_tool(tool_name: &str) -> Option<String> {
         .map(|(server_name, _)| normalize_mcp_server_name(server_name))?;
     cached_mcp_server_commands().get(&server_name).cloned()
 }
+
 fn cached_mcp_server_commands() -> HashMap<String, String> {
     let path = mcp_json_path();
     let mut cache = MCP_SERVER_COMMANDS
@@ -206,6 +216,7 @@ fn cached_mcp_server_commands() -> HashMap<String, String> {
         .map(|cache| cache.commands.clone())
         .unwrap_or_default()
 }
+
 fn mcp_json_path() -> PathBuf {
     if let Some(path) =
         std::env::var_os("RUST_CHATBOT_MCP_JSON_PATH").filter(|value| !value.is_empty())
@@ -217,6 +228,7 @@ fn mcp_json_path() -> PathBuf {
         .map(|home| home.join(".rust-chatbot").join(".mcp.json"))
         .unwrap_or_else(|| PathBuf::from(".mcp.json"))
 }
+
 fn load_mcp_server_commands(path: &std::path::Path) -> HashMap<String, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -244,6 +256,7 @@ fn load_mcp_server_commands(path: &std::path::Path) -> HashMap<String, String> {
 
     commands
 }
+
 fn extend_mcp_server_commands(
     commands: &mut HashMap<String, String>,
     servers: &serde_json::Map<String, Value>,
@@ -254,9 +267,11 @@ fn extend_mcp_server_commands(
         }
     }
 }
+
 fn normalize_mcp_server_name(name: &str) -> String {
     name.replace('-', "_")
 }
+
 fn format_server_command(entry: &Value) -> Option<String> {
     let object = entry.as_object()?;
     let command = object.get("command").and_then(|value| value.as_str())?;
@@ -270,6 +285,7 @@ fn format_server_command(entry: &Value) -> Option<String> {
     }
     Some(parts.join(" "))
 }
+
 fn resolve_tool_input_value(input: &Value) -> Option<Value> {
     for candidate in [
         input.get("input"),
@@ -292,6 +308,7 @@ fn resolve_tool_input_value(input: &Value) -> Option<Value> {
     }
     None
 }
+
 fn parse_embedded_json(value: &Value) -> Value {
     match value {
         Value::String(text) => {
@@ -300,6 +317,7 @@ fn parse_embedded_json(value: &Value) -> Value {
         _ => value.clone(),
     }
 }
+
 fn format_preview_value(name: &str, input: &Value) -> String {
     if let Some(command) = command_like_preview(input) {
         return command;
@@ -354,6 +372,7 @@ fn format_preview_value(name: &str, input: &Value) -> String {
         }
     }
 }
+
 fn command_like_preview(input: &Value) -> Option<String> {
     let object = input.as_object()?;
     if let Some(command_line) = object.get("command_line").and_then(|value| value.as_str()) {
@@ -372,6 +391,7 @@ fn command_like_preview(input: &Value) -> Option<String> {
     }
     None
 }
+
 fn push_preview_part(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
     let Some(value) = value else {
         return;
@@ -387,6 +407,7 @@ fn push_preview_part(parts: &mut Vec<String>, label: &str, value: Option<&Value>
         parts.push(format!("{label}={rendered}"));
     }
 }
+
 fn push_count_part(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
     if let Some(count) = value
         .and_then(|value| value.as_array())
@@ -395,6 +416,7 @@ fn push_count_part(parts: &mut Vec<String>, label: &str, value: Option<&Value>) 
         parts.push(format!("{label}={count}"));
     }
 }
+
 fn format_array_or_scalar(value: &Value) -> String {
     match value {
         Value::Array(values) => values
@@ -413,6 +435,7 @@ fn format_array_or_scalar(value: &Value) -> String {
         _ => value.to_string(),
     }
 }
+
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -427,4 +450,122 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         end = idx + ch.len_utf8();
     }
     format!("{}...", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_tool_input_preview;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn formats_filesystem_path_preview_without_raw_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mcp_json = temp.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"mcp-filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp/root"]}}}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("RUST_CHATBOT_MCP_JSON_PATH");
+        std::env::set_var("RUST_CHATBOT_MCP_JSON_PATH", &mcp_json);
+        let preview = format_tool_input_preview(
+            "mcp__mcp-filesystem__list_directory",
+            &json!({
+                "path": "/tmp/workspace"
+            }),
+        );
+
+        assert_eq!(
+            preview,
+            "server=npx -y @modelcontextprotocol/server-filesystem /tmp/root | path=/tmp/workspace"
+        );
+        restore_mcp_path(previous);
+    }
+
+    #[test]
+    fn formats_build_command_preview() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mcp_json = temp.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"lightweight-builds":{"command":"cargo","args":["run","--quiet","--manifest-path","/tmp/l/C.toml"]}}}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("RUST_CHATBOT_MCP_JSON_PATH");
+        std::env::set_var("RUST_CHATBOT_MCP_JSON_PATH", &mcp_json);
+        let preview = format_tool_input_preview(
+            "mcp__lightweight_builds__run_build",
+            &json!({
+                "project_path": "/tmp/project",
+                "command_override": ["cargo", "test", "--lib"]
+            }),
+        );
+
+        assert_eq!(
+            preview,
+            "server=cargo run --quiet --manifest-path /tmp/l/C.toml | project_path=/tmp/project | command=cargo test --lib"
+        );
+        restore_mcp_path(previous);
+    }
+
+    #[test]
+    fn formats_embedded_json_argument_strings() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mcp_json = temp.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"Context7":{"command":"npx","args":["-y","@upstash/context7-mcp@latest"]}}}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("RUST_CHATBOT_MCP_JSON_PATH");
+        std::env::set_var("RUST_CHATBOT_MCP_JSON_PATH", &mcp_json);
+        let preview = format_tool_input_preview(
+            "mcp__Context7__query_docs",
+            &json!("{\"libraryId\":\"/vercel/next.js\",\"query\":\"app router cache\"}"),
+        );
+
+        assert_eq!(
+            preview,
+            "server=npx -y @upstash/context7-mcp@latest | libraryId=/vercel/next.js | query=app router cache"
+        );
+        restore_mcp_path(previous);
+    }
+
+    #[test]
+    fn loads_server_command_from_provider_scoped_mcp_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mcp_json = temp.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers":{"mcp-coordinator":{"command":"cargo","args":["run"]}},"providers":{"codex":{"mcpServers":{"lightweight-builds":{"command":"cargo","args":["run","--quiet","--manifest-path","/tmp/l/C.toml"]}}}}}"#,
+        )
+        .unwrap();
+        let previous = std::env::var_os("RUST_CHATBOT_MCP_JSON_PATH");
+        std::env::set_var("RUST_CHATBOT_MCP_JSON_PATH", &mcp_json);
+
+        let preview = format_tool_input_preview(
+            "mcp__lightweight_builds__run_build",
+            &json!({ "project_path": "/tmp/project" }),
+        );
+
+        assert_eq!(
+            preview,
+            "server=cargo run --quiet --manifest-path /tmp/l/C.toml | project_path=/tmp/project"
+        );
+        restore_mcp_path(previous);
+    }
+
+    fn restore_mcp_path(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(previous) => std::env::set_var("RUST_CHATBOT_MCP_JSON_PATH", previous),
+            None => std::env::remove_var("RUST_CHATBOT_MCP_JSON_PATH"),
+        }
+    }
 }
